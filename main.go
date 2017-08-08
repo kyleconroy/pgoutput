@@ -6,11 +6,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
-	"reflect"
 	"time"
 
 	"github.com/jackc/pgx"
-	"github.com/pkg/errors"
 )
 
 type decoder struct {
@@ -35,6 +33,15 @@ func (d *decoder) uint16() uint16 {
 	return x
 }
 
+func (d *decoder) string() string {
+	s, err := d.buf.ReadBytes(0)
+	if err != nil {
+		// TODO: Return an error
+		panic(err)
+	}
+	return string(s[:len(s)-1])
+}
+
 func (d *decoder) uint32() uint32 {
 	x := d.order.Uint32(d.buf.Next(4))
 	return x
@@ -51,92 +58,48 @@ func (d *decoder) int16() int16 { return int16(d.uint16()) }
 func (d *decoder) int32() int32 { return int32(d.uint32()) }
 func (d *decoder) int64() int64 { return int64(d.uint64()) }
 
-var byteSlice = reflect.TypeOf([]byte(nil))
-
-type Decodable interface {
-	Decode(binary.ByteOrder, *bytes.Buffer)
-}
-
-func (d *decoder) value(v reflect.Value) {
-	fmt.Println(d.buf.Bytes())
-	if v.CanAddr() {
-		if u, ok := v.Addr().Interface().(Decodable); ok {
-			u.Decode(d.order, d.buf)
-			return
-		}
-	}
-	switch v.Kind() {
-	case reflect.Struct:
-		l := v.NumField()
-		for i := 0; i < l; i++ {
-			// Note: Calling v.CanSet() below is an optimization.
-			// It would be sufficient to check the field name,
-			// but creating the StructField info for each field is
-			// costly (run "go test -bench=ReadStruct" and compare
-			// results when making changes to this code).
-			fmt.Println(v.Type().Field(i).Name)
-			if v := v.Field(i); v.CanSet() {
-				d.value(v)
-			}
-		}
-	case reflect.Slice:
-		size := int(d.uint16())
-		fmt.Println("slice", size)
-		v.Set(reflect.MakeSlice(v.Type(), size, size))
-		for i := 0; i < v.Len(); i++ {
-			d.value(v.Index(i))
-		}
-	case reflect.Bool:
-		fmt.Println(v.Type())
-		v.SetBool(d.bool())
-	case reflect.String:
-		s, err := d.buf.ReadBytes(0)
-		if err != nil {
-			// TODO: Return an error
-			panic(err)
-		}
-		v.SetString(string(s[:len(s)-1]))
-	case reflect.Int8:
-		v.SetInt(int64(d.int8()))
-	case reflect.Int16:
-		v.SetInt(int64(d.int16()))
-	case reflect.Int32:
-		v.SetInt(int64(d.int32()))
-	case reflect.Int64:
-		v.SetInt(d.int64())
-	case reflect.Uint8:
-		v.SetUint(uint64(d.uint8()))
-	case reflect.Uint16:
-		v.SetUint(uint64(d.uint16()))
-	case reflect.Uint32:
-		v.SetUint(uint64(d.uint32()))
-	case reflect.Uint64:
-		v.SetUint(d.uint64())
-	}
-}
-
-type Timestamp time.Time
-
-func (t *Timestamp) Decode(order binary.ByteOrder, src *bytes.Buffer) {
-	micro := int(order.Uint64(src.Next(8)))
+func (d *decoder) timestamp() time.Time {
+	micro := int(d.uint64())
 	ts := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
-	*t = Timestamp(ts.Add(time.Duration(micro) * time.Microsecond))
-	fmt.Println(time.Time(*t).String())
+	return ts.Add(time.Duration(micro) * time.Microsecond)
 }
 
-type RowInfo string
-
-func (t *RowInfo) Decode(order binary.ByteOrder, src *bytes.Buffer) {
-	switch src.Next(1)[0] {
-	case 'O':
-		fmt.Println("OLD")
-		*t = "OLD"
-	case 'K':
-		fmt.Println("KEY")
-		*t = "KEY"
-	default:
-		src.UnreadByte()
+func (d *decoder) rowinfo(char byte) bool {
+	if d.buf.Next(1)[0] == char {
+		return true
+	} else {
+		d.buf.UnreadByte()
+		return false
 	}
+}
+
+func (d *decoder) tupledata() []Tuple {
+	size := int(d.uint16())
+	data := make([]Tuple, size)
+	for i := 0; i < size; i++ {
+		switch d.buf.Next(1)[0] {
+		case 'n':
+		case 'u':
+		case 't':
+			vsize := int(d.order.Uint32(d.buf.Next(4)))
+			data[i] = Tuple{Flag: 't', Value: d.buf.Next(vsize)}
+		}
+	}
+	return data
+}
+
+func (d *decoder) columns() []Column {
+	size := int(d.uint16())
+	data := make([]Column, size)
+	for i := 0; i < size; i++ {
+		data[i] = Column{
+			Key:  d.bool(),
+			Name: d.string(),
+			Mode: d.uint32(),
+			Type: d.uint32(),
+		}
+	}
+	return data
 }
 
 type Begin struct {
@@ -144,17 +107,18 @@ type Begin struct {
 	LSN uint64
 	// Commit timestamp of the transaction. The value is in number of
 	// microseconds since PostgreSQL epoch (2000-01-01).
-	Timestamp Timestamp
+	Timestamp time.Time
 	// 	Xid of the transaction.
 	XID int32
 }
 
 type Commit struct {
+	Flags uint8
 	// The final LSN of the transaction.
 	LSN uint64
 	// The final LSN of the transaction.
 	TransactionLSN uint64
-	Timestamp      Timestamp
+	Timestamp      time.Time
 }
 
 type Relation struct {
@@ -179,20 +143,20 @@ type Update struct {
 	/// ID of the relation corresponding to the ID in the relation message.
 	RelationID uint32
 	// Identifies the following TupleData message as a new tuple.
-	Old    RowInfo
-	Key    RowInfo
-	OldRow []Tuple
-
+	Old    bool
+	Key    bool
 	New    bool
-	NewRow []Tuple
+	OldRow []Tuple
+	Row    []Tuple
 }
 
 type Delete struct {
 	/// ID of the relation corresponding to the ID in the relation message.
 	RelationID uint32
 	// Identifies the following TupleData message as a new tuple.
-	KeyOrOld bool // TODO
-	Row      []Tuple
+	Key bool // TODO
+	Old bool // TODO
+	Row []Tuple
 }
 
 type Origin struct {
@@ -212,47 +176,63 @@ type Tuple struct {
 	Value []byte
 }
 
-func (t *Tuple) Decode(order binary.ByteOrder, src *bytes.Buffer) {
-	switch src.Next(1)[0] {
-	case 'n':
-	case 'u':
-	case 't':
-		size := int(order.Uint32(src.Next(4)))
-		t.Flag = 't'
-		t.Value = src.Next(size)
-	}
-}
-
-type TupleData struct {
-	Tuples []Tuple
-}
-
-func parse(src []byte) error {
+func parse(src []byte) interface{} {
 	msgType := src[0]
-	var msg interface{}
+	d := &decoder{order: binary.BigEndian, buf: bytes.NewBuffer(src[1:])}
 	switch msgType {
 	case 'B':
-		msg = &Begin{}
+		b := Begin{}
+		b.LSN = d.uint64()
+		b.Timestamp = d.timestamp()
+		b.XID = d.int32()
+		return b
 	case 'C':
-		msg = &Commit{}
+		c := Commit{}
+		c.Flags = d.uint8()
+		c.LSN = d.uint64()
+		c.TransactionLSN = d.uint64()
+		c.Timestamp = d.timestamp()
+		return c
 	case 'O':
-		msg = &Origin{}
+		o := Origin{}
+		o.LSN = d.uint64()
+		o.Name = d.string()
+		return o
 	case 'R':
-		msg = &Relation{}
+		r := Relation{}
+		r.ID = d.uint32()
+		r.Namespace = d.string()
+		r.Name = d.string()
+		r.Replica = d.uint8()
+		r.Columns = d.columns()
+		return r
 	case 'I':
-		msg = &Insert{}
+		i := Insert{}
+		i.RelationID = d.uint32()
+		i.New = d.uint8() > 0
+		i.Row = d.tupledata()
+		return i
 	case 'U':
-		msg = &Update{}
+		u := Update{}
+		u.RelationID = d.uint32()
+		u.Key = d.rowinfo('K')
+		u.Old = d.rowinfo('O')
+		if u.Key || u.Old {
+			u.OldRow = d.tupledata()
+		}
+		u.New = d.uint8() > 0
+		u.Row = d.tupledata()
+		return u
 	case 'D':
-		msg = &Delete{}
+		dl := Delete{}
+		dl.RelationID = d.uint32()
+		dl.Key = d.rowinfo('K')
+		dl.Old = d.rowinfo('O')
+		dl.Row = d.tupledata()
+		return dl
 	default:
-		return errors.Errorf("unknown message type: %c", msgType)
+		return nil
 	}
-	v := reflect.Indirect(reflect.ValueOf(msg))
-	d := &decoder{order: binary.BigEndian, buf: bytes.NewBuffer(src[1:])}
-	d.value(v)
-	fmt.Printf("%#v\n", msg)
-	return nil
 }
 
 func main() {
@@ -286,7 +266,20 @@ func main() {
 			// public.replication_test: INSERT: a[integer]:2
 			// What we wanna do here is check that once we find one of our inserted times,
 			// that they occur in the wal stream in the order we executed them.
-			parse(message.WalMessage.WalData)
+			switch m := parse(message.WalMessage.WalData).(type) {
+			case Insert:
+				for _, tuple := range m.Row {
+					fmt.Println(string(tuple.Value))
+				}
+			case Update:
+				for _, tuple := range m.Row {
+					fmt.Println(string(tuple.Value))
+				}
+			case Delete:
+				for _, tuple := range m.Row {
+					fmt.Println(string(tuple.Value))
+				}
+			}
 		}
 		if message.ServerHeartbeat != nil {
 			log.Printf("Got heartbeat: %s", message.ServerHeartbeat)
