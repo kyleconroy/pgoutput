@@ -6,45 +6,221 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"reflect"
+	"time"
 
 	"github.com/jackc/pgx"
 	"github.com/pkg/errors"
 )
+
+type decoder struct {
+	order binary.ByteOrder
+	buf   *bytes.Buffer
+}
+
+func (d *decoder) bool() bool {
+	x := d.buf.Next(1)[0]
+	return x != 0
+
+}
+
+func (d *decoder) uint8() uint8 {
+	x := d.buf.Next(1)[0]
+	return x
+
+}
+
+func (d *decoder) uint16() uint16 {
+	x := d.order.Uint16(d.buf.Next(2))
+	return x
+}
+
+func (d *decoder) uint32() uint32 {
+	x := d.order.Uint32(d.buf.Next(4))
+	return x
+
+}
+
+func (d *decoder) uint64() uint64 {
+	x := d.order.Uint64(d.buf.Next(8))
+	return x
+}
+
+func (d *decoder) int8() int8   { return int8(d.uint8()) }
+func (d *decoder) int16() int16 { return int16(d.uint16()) }
+func (d *decoder) int32() int32 { return int32(d.uint32()) }
+func (d *decoder) int64() int64 { return int64(d.uint64()) }
+
+var byteSlice = reflect.TypeOf([]byte(nil))
+
+type Decodable interface {
+	Decode(binary.ByteOrder, *bytes.Buffer)
+}
+
+func (d *decoder) value(v reflect.Value) {
+	fmt.Println(d.buf.Bytes())
+	if v.CanAddr() {
+		if u, ok := v.Addr().Interface().(Decodable); ok {
+			u.Decode(d.order, d.buf)
+			return
+		}
+	}
+	switch v.Kind() {
+	case reflect.Struct:
+		l := v.NumField()
+		for i := 0; i < l; i++ {
+			// Note: Calling v.CanSet() below is an optimization.
+			// It would be sufficient to check the field name,
+			// but creating the StructField info for each field is
+			// costly (run "go test -bench=ReadStruct" and compare
+			// results when making changes to this code).
+			fmt.Println(v.Type().Field(i).Name)
+			if v := v.Field(i); v.CanSet() {
+				d.value(v)
+			}
+		}
+	case reflect.Slice:
+		size := int(d.uint16())
+		fmt.Println("slice", size)
+		v.Set(reflect.MakeSlice(v.Type(), size, size))
+		for i := 0; i < v.Len(); i++ {
+			d.value(v.Index(i))
+		}
+	case reflect.Bool:
+		fmt.Println(v.Type())
+		v.SetBool(d.bool())
+	case reflect.String:
+		s, err := d.buf.ReadBytes(0)
+		if err != nil {
+			// TODO: Return an error
+			panic(err)
+		}
+		v.SetString(string(s[:len(s)-1]))
+	case reflect.Int8:
+		v.SetInt(int64(d.int8()))
+	case reflect.Int16:
+		v.SetInt(int64(d.int16()))
+	case reflect.Int32:
+		v.SetInt(int64(d.int32()))
+	case reflect.Int64:
+		v.SetInt(d.int64())
+	case reflect.Uint8:
+		v.SetUint(uint64(d.uint8()))
+	case reflect.Uint16:
+		v.SetUint(uint64(d.uint16()))
+	case reflect.Uint32:
+		v.SetUint(uint64(d.uint32()))
+	case reflect.Uint64:
+		v.SetUint(d.uint64())
+	}
+}
+
+type Timestamp time.Time
+
+func (t *Timestamp) Decode(order binary.ByteOrder, src *bytes.Buffer) {
+	micro := int(order.Uint64(src.Next(8)))
+	ts := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	*t = Timestamp(ts.Add(time.Duration(micro) * time.Microsecond))
+	fmt.Println(time.Time(*t).String())
+}
+
+type RowInfo string
+
+func (t *RowInfo) Decode(order binary.ByteOrder, src *bytes.Buffer) {
+	switch src.Next(1)[0] {
+	case 'O':
+		fmt.Println("OLD")
+		*t = "OLD"
+	case 'K':
+		fmt.Println("KEY")
+		*t = "KEY"
+	default:
+		src.UnreadByte()
+	}
+}
 
 type Begin struct {
 	// The final LSN of the transaction.
 	LSN uint64
 	// Commit timestamp of the transaction. The value is in number of
 	// microseconds since PostgreSQL epoch (2000-01-01).
-	Timestamp uint64
+	Timestamp Timestamp
 	// 	Xid of the transaction.
 	XID int32
 }
 
+type Commit struct {
+	// The final LSN of the transaction.
+	LSN uint64
+	// The final LSN of the transaction.
+	TransactionLSN uint64
+	Timestamp      Timestamp
+}
+
+type Relation struct {
+	// ID of the relation.
+	ID uint32
+	// Namespace (empty string for pg_catalog).
+	Namespace string
+	Name      string
+	Replica   uint8
+	Columns   []Column
+}
+
 type Insert struct {
 	/// ID of the relation corresponding to the ID in the relation message.
-	RelationID int
+	RelationID uint32
 	// Identifies the following TupleData message as a new tuple.
-	TupleData TupleData
+	New bool
+	Row []Tuple
+}
+
+type Update struct {
+	/// ID of the relation corresponding to the ID in the relation message.
+	RelationID uint32
+	// Identifies the following TupleData message as a new tuple.
+	Old    RowInfo
+	Key    RowInfo
+	OldRow []Tuple
+
+	New    bool
+	NewRow []Tuple
+}
+
+type Delete struct {
+	/// ID of the relation corresponding to the ID in the relation message.
+	RelationID uint32
+	// Identifies the following TupleData message as a new tuple.
+	KeyOrOld bool // TODO
+	Row      []Tuple
+}
+
+type Origin struct {
+	LSN  uint64
+	Name string
 }
 
 type Column struct {
 	Key  bool
 	Name string
-	Mode int
-	Type int
-}
-
-type Relation struct {
-	ID        int
-	Namespace string
-	Name      string
-	Replica   int
-	Columns   []Column
+	Mode uint32
+	Type uint32
 }
 
 type Tuple struct {
-	Value string
+	Flag  int8
+	Value []byte
+}
+
+func (t *Tuple) Decode(order binary.ByteOrder, src *bytes.Buffer) {
+	switch src.Next(1)[0] {
+	case 'n':
+	case 'u':
+	case 't':
+		size := int(order.Uint32(src.Next(4)))
+		t.Flag = 't'
+		t.Value = src.Next(size)
+	}
 }
 
 type TupleData struct {
@@ -53,82 +229,29 @@ type TupleData struct {
 
 func parse(src []byte) error {
 	msgType := src[0]
-	buf := bytes.NewBuffer(src[1:])
-
+	var msg interface{}
 	switch msgType {
 	case 'B':
-		b := Begin{}
-		if err := binary.Read(buf, binary.BigEndian, &b); err != nil {
-			return fmt.Errorf("cloud not parse begin message: %s", err)
-		}
-		// ts := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
-		// b.Date = ts.Add(time.Duration(micro) * time.Microsecond)
-		fmt.Printf("%#v\n", b)
+		msg = &Begin{}
 	case 'C':
-		fmt.Println("Commit")
+		msg = &Commit{}
 	case 'O':
-		fmt.Println("Origin")
+		msg = &Origin{}
 	case 'R':
-		r := Relation{}
-		r.ID = int(binary.BigEndian.Uint32(buf.Next(4)))
-		ns, err := buf.ReadBytes(0)
-		if err != nil {
-			return fmt.Errorf("error on ns: %s", err)
-		}
-		r.Namespace = string(ns[:len(ns)-1])
-		name, err := buf.ReadBytes(0)
-		if err != nil {
-			return fmt.Errorf("error on name: %s", err)
-		}
-		r.Name = string(name[:len(name)-1])
-		r.Replica = int(buf.Next(1)[0])
-
-		columns := int(binary.BigEndian.Uint16(buf.Next(2)))
-		r.Columns = make([]Column, columns)
-
-		for i := 0; i < columns; i++ {
-			// Flags for the column. Currently can be either 0 for no flags or 1 which marks the column as part of the key.
-			flags := int(buf.Next(1)[0])
-			col, err := buf.ReadBytes(0)
-			if err != nil {
-				return fmt.Errorf("error on col: %s", err)
-			}
-			r.Columns[i] = Column{
-				Key:  flags > 0,
-				Name: string(col[:len(col)-1]),
-				Type: int(binary.BigEndian.Uint32(buf.Next(4))),
-				Mode: int(binary.BigEndian.Uint32(buf.Next(4))),
-			}
-		}
-		fmt.Printf("%#v\n", r)
+		msg = &Relation{}
 	case 'I':
-		in := Insert{}
-		in.RelationID = int(binary.BigEndian.Uint32(buf.Next(4)))
-		if td := buf.Next(1); td[0] != 'N' {
-			return fmt.Errorf("Expected Insert message to have new tuple set")
-		}
-		columns := int(binary.BigEndian.Uint16(buf.Next(2)))
-		td := TupleData{}
-		td.Tuples = make([]Tuple, columns)
-		in.TupleData = td
-		for i := 0; i < columns; i++ {
-			columnType := buf.Next(1)
-			switch columnType[0] {
-			case 'n':
-			case 'u':
-			case 't':
-				columnLength := int(binary.BigEndian.Uint32(buf.Next(4)))
-				td.Tuples[i] = Tuple{string(buf.Next(columnLength))}
-			}
-		}
-		fmt.Printf("%#v\n", in)
+		msg = &Insert{}
 	case 'U':
-		fmt.Println("Update")
+		msg = &Update{}
 	case 'D':
-		fmt.Println("Delete")
+		msg = &Delete{}
 	default:
 		return errors.Errorf("unknown message type: %c", msgType)
 	}
+	v := reflect.Indirect(reflect.ValueOf(msg))
+	d := &decoder{order: binary.BigEndian, buf: bytes.NewBuffer(src[1:])}
+	d.value(v)
+	fmt.Printf("%#v\n", msg)
 	return nil
 }
 
