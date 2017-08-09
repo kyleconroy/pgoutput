@@ -1,14 +1,10 @@
-package main
+package pgoutput
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"time"
-
-	"github.com/jackc/pgx"
 )
 
 type decoder struct {
@@ -95,8 +91,8 @@ func (d *decoder) columns() []Column {
 		data[i] = Column{
 			Key:  d.bool(),
 			Name: d.string(),
-			Mode: d.uint32(),
 			Type: d.uint32(),
+			Mode: d.uint32(),
 		}
 	}
 	return data
@@ -167,8 +163,8 @@ type Origin struct {
 type Column struct {
 	Key  bool
 	Name string
-	Mode uint32
 	Type uint32
+	Mode uint32
 }
 
 type Tuple struct {
@@ -176,7 +172,19 @@ type Tuple struct {
 	Value []byte
 }
 
-func parse(src []byte) interface{} {
+type Message interface {
+	msg()
+}
+
+func (Begin) msg()    {}
+func (Relation) msg() {}
+func (Update) msg()   {}
+func (Insert) msg()   {}
+func (Delete) msg()   {}
+func (Commit) msg()   {}
+func (Origin) msg()   {}
+
+func Parse(src []byte) (Message, error) {
 	msgType := src[0]
 	d := &decoder{order: binary.BigEndian, buf: bytes.NewBuffer(src[1:])}
 	switch msgType {
@@ -185,19 +193,19 @@ func parse(src []byte) interface{} {
 		b.LSN = d.uint64()
 		b.Timestamp = d.timestamp()
 		b.XID = d.int32()
-		return b
+		return b, nil
 	case 'C':
 		c := Commit{}
 		c.Flags = d.uint8()
 		c.LSN = d.uint64()
 		c.TransactionLSN = d.uint64()
 		c.Timestamp = d.timestamp()
-		return c
+		return c, nil
 	case 'O':
 		o := Origin{}
 		o.LSN = d.uint64()
 		o.Name = d.string()
-		return o
+		return o, nil
 	case 'R':
 		r := Relation{}
 		r.ID = d.uint32()
@@ -205,13 +213,13 @@ func parse(src []byte) interface{} {
 		r.Name = d.string()
 		r.Replica = d.uint8()
 		r.Columns = d.columns()
-		return r
+		return r, nil
 	case 'I':
 		i := Insert{}
 		i.RelationID = d.uint32()
 		i.New = d.uint8() > 0
 		i.Row = d.tupledata()
-		return i
+		return i, nil
 	case 'U':
 		u := Update{}
 		u.RelationID = d.uint32()
@@ -222,67 +230,15 @@ func parse(src []byte) interface{} {
 		}
 		u.New = d.uint8() > 0
 		u.Row = d.tupledata()
-		return u
+		return u, nil
 	case 'D':
 		dl := Delete{}
 		dl.RelationID = d.uint32()
 		dl.Key = d.rowinfo('K')
 		dl.Old = d.rowinfo('O')
 		dl.Row = d.tupledata()
-		return dl
+		return dl, nil
 	default:
-		return nil
-	}
-}
-
-func main() {
-	config := pgx.ConnConfig{
-		Database: "opsdash",
-		User:     "replicant",
-	}
-
-	conn, err := pgx.ReplicationConnect(config)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = conn.StartReplication("sub1", 0, -1, `("proto_version" '1', "publication_names" 'pub1')`)
-	if err != nil {
-		log.Fatalf("Failed to start replication: %v", err)
-	}
-
-	ctx := context.Background()
-
-	for {
-		var message *pgx.ReplicationMessage
-
-		message, err = conn.WaitForReplicationMessage(ctx)
-		if err != nil {
-			log.Fatalf("Replication failed: %v %s", err)
-		}
-
-		if message.WalMessage != nil {
-			// The waldata payload with the test_decoding plugin looks like:
-			// public.replication_test: INSERT: a[integer]:2
-			// What we wanna do here is check that once we find one of our inserted times,
-			// that they occur in the wal stream in the order we executed them.
-			switch m := parse(message.WalMessage.WalData).(type) {
-			case Insert:
-				for _, tuple := range m.Row {
-					fmt.Println(string(tuple.Value))
-				}
-			case Update:
-				for _, tuple := range m.Row {
-					fmt.Println(string(tuple.Value))
-				}
-			case Delete:
-				for _, tuple := range m.Row {
-					fmt.Println(string(tuple.Value))
-				}
-			}
-		}
-		if message.ServerHeartbeat != nil {
-			log.Printf("Got heartbeat: %s", message.ServerHeartbeat)
-		}
+		return nil, fmt.Errorf("Unknown message type for %r", msgType)
 	}
 }
