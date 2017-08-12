@@ -3,67 +3,16 @@ package pgoutput
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"path/filepath"
 	"testing"
 
-	"google.golang.org/api/option"
-
-	"cloud.google.com/go/bigquery"
-
+	"github.com/google/go-cmp/cmp"
 	"github.com/jackc/pgx"
-	"github.com/jackc/pgx/pgtype"
 )
 
-type rowSaver struct {
-	rel Relation
-	row []Tuple
-}
-
-type typeDecoder interface {
-	pgtype.TextDecoder
-	pgtype.Value
-}
-
-func infer(rel Relation) bigquery.Schema {
-	schema := []*bigquery.FieldSchema{}
-	for _, col := range rel.Columns {
-		switch col.Type {
-		case pgtype.TextOID:
-			schema = append(schema, &bigquery.FieldSchema{
-				Name: col.Name,
-				Type: bigquery.StringFieldType,
-			})
-		case pgtype.Int4OID:
-			schema = append(schema, &bigquery.FieldSchema{
-				Name: col.Name,
-				Type: bigquery.IntegerFieldType,
-			})
-		default:
-		}
-	}
-	return bigquery.Schema(schema)
-}
-
-func (rs *rowSaver) Save() (map[string]bigquery.Value, string, error) {
-	values := map[string]bigquery.Value{}
-	for i, tuple := range rs.row {
-		col := rs.rel.Columns[i]
-		var decoder typeDecoder
-		switch col.Type {
-		case pgtype.TextOID:
-			decoder = &pgtype.Text{}
-		case pgtype.Int4OID:
-			decoder = &pgtype.Int4{}
-		default:
-			panic("don't know type")
-		}
-		decoder.DecodeText(nil, tuple.Value)
-		values[col.Name] = bigquery.Value(decoder.Get())
-	}
-	return values, "", nil
-}
-
-func TestLogicalReplication(t *testing.T) {
+func GenerateLogicalReplicationFiles(t *testing.T) {
 	config := pgx.ConnConfig{
 		Database: "opsdash",
 		User:     "replicant",
@@ -80,16 +29,7 @@ func TestLogicalReplication(t *testing.T) {
 	}
 
 	ctx := context.Background()
-
-	client, err := bigquery.NewClient(ctx, "pgdataflow", option.WithCredentialsFile("pgdataflow-662555ce817d.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	d := client.Dataset("my_dataset")
-	ta := d.Table("foo")
-	u := ta.Uploader()
-
-	var rel Relation
+	count := 0
 
 	for {
 		var message *pgx.ReplicationMessage
@@ -100,41 +40,54 @@ func TestLogicalReplication(t *testing.T) {
 		}
 
 		if message.WalMessage != nil {
-			// The waldata payload with the test_decoding plugin looks like:
-			m, err := Parse(message.WalMessage.WalData)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			switch v := m.(type) {
-			case Relation:
-				rel = v
-				// if err := ta.Create(ctx, infer(rel)); err != nil {
-				// 	t.Fatal(err)
-				// }
-			case Insert:
-				fmt.Println("insert")
-				rs := rowSaver{rel, v.Row}
-				// Schema is inferred from the score type.
-				if err := u.Put(ctx, &rs); err != nil {
-					if pme, ok := err.(bigquery.PutMultiError); ok {
-						errs := []bigquery.RowInsertionError(pme)
-						t.Log(errs)
-					}
-					t.Fatalf("%#v", err)
-				}
-			case Update:
-				for _, tuple := range v.Row {
-					fmt.Println(string(tuple.Value))
-				}
-			case Delete:
-				for _, tuple := range v.Row {
-					fmt.Println(string(tuple.Value))
-				}
-			}
+			ioutil.WriteFile(fmt.Sprintf("%03d.waldata", count), message.WalMessage.WalData, 0644)
+			count += 1
 		}
 		if message.ServerHeartbeat != nil {
 			log.Printf("Got heartbeat: %s", message.ServerHeartbeat)
+		}
+	}
+}
+
+func TestParseWalData(t *testing.T) {
+	files, _ := filepath.Glob("testdata/*")
+	set := NewRelationSet()
+
+	expected := map[int]struct {
+		ID  int32
+		Val string
+	}{
+		2:  {40, "forty"},
+		11: {11, "eleven"},
+		14: {12, "twelve"},
+	}
+
+	for i, file := range files {
+		waldata, _ := ioutil.ReadFile(file)
+		m, err := Parse(waldata)
+		if err != nil {
+			t.Errorf("error parsing %s: %s", file, err)
+			continue
+		}
+
+		switch v := m.(type) {
+		case Relation:
+			set.Add(v)
+		case Insert:
+			t.Run(fmt.Sprintf("waldata/%d", i), func(t *testing.T) {
+				values, err := set.Values(v.RelationID, v.Row)
+				if err != nil {
+					t.Error(err)
+				}
+
+				exp := expected[i]
+				if diff := cmp.Diff(exp.ID, values["id"].Get()); diff != "" {
+					t.Errorf("id: %s", diff)
+				}
+				if diff := cmp.Diff(exp.Val, values["val"].Get()); diff != "" {
+					t.Errorf("val: %s", diff)
+				}
+			})
 		}
 	}
 }

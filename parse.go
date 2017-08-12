@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/pgtype"
 )
 
 type decoder struct {
@@ -160,13 +162,17 @@ type Origin struct {
 	Name string
 }
 
+type DecoderValue interface {
+	pgtype.TextDecoder
+	pgtype.Value
+}
+
 type Column struct {
 	Key  bool
 	Name string
 	Type uint32
 	Mode uint32
 }
-
 type Tuple struct {
 	Flag  int8
 	Value []byte
