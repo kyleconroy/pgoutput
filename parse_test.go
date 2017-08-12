@@ -60,7 +60,7 @@ func (rs *rowSaver) Save() (map[string]bigquery.Value, string, error) {
 		decoder.DecodeText(nil, tuple.Value)
 		values[col.Name] = bigquery.Value(decoder.Get())
 	}
-	return values, "bar", nil
+	return values, "", nil
 }
 
 func TestLogicalReplication(t *testing.T) {
@@ -113,6 +113,7 @@ func TestLogicalReplication(t *testing.T) {
 				// 	t.Fatal(err)
 				// }
 			case Insert:
+				fmt.Println("insert")
 				rs := rowSaver{rel, v.Row}
 				// Schema is inferred from the score type.
 				if err := u.Put(ctx, &rs); err != nil {
