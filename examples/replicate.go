@@ -1,6 +1,3 @@
-# pgoutput
-
-```go
 package main
 
 import (
@@ -21,7 +18,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-  // Create a slot if it doesn't already exist
 	// if err := conn.CreateReplicationSlot("sub2", "pgoutput"); err != nil {
 	// 	log.Fatalf("Failed to create replication slot: %v", err)
 	// }
@@ -66,8 +62,9 @@ func main() {
 		Handler:       handler,
 	}
 
+	// Create slot
+
 	if err := replication.Start(ctx, conn); err != nil {
 		log.Fatal(err)
 	}
 }
-```
