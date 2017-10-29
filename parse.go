@@ -245,6 +245,6 @@ func Parse(src []byte) (Message, error) {
 		dl.Row = d.tupledata()
 		return dl, nil
 	default:
-		return nil, fmt.Errorf("Unknown message type for %r", msgType)
+		return nil, fmt.Errorf("Unknown message type for %s (%d)", []byte{msgType}, msgType)
 	}
 }
