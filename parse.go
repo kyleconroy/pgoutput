@@ -129,6 +129,13 @@ type Relation struct {
 	Columns   []Column
 }
 
+type Type struct {
+	// ID of the data type
+	ID        uint32
+	Namespace string
+	Name      string
+}
+
 type Insert struct {
 	/// ID of the relation corresponding to the ID in the relation message.
 	RelationID uint32
@@ -189,7 +196,10 @@ func (Insert) msg()   {}
 func (Delete) msg()   {}
 func (Commit) msg()   {}
 func (Origin) msg()   {}
+func (Type) msg()     {}
 
+// Parse a logical replication message.
+// See https://www.postgresql.org/docs/current/static/protocol-logicalrep-message-formats.html
 func Parse(src []byte) (Message, error) {
 	msgType := src[0]
 	d := &decoder{order: binary.BigEndian, buf: bytes.NewBuffer(src[1:])}
@@ -220,6 +230,12 @@ func Parse(src []byte) (Message, error) {
 		r.Replica = d.uint8()
 		r.Columns = d.columns()
 		return r, nil
+	case 'Y':
+		t := Type{}
+		t.ID = d.uint32()
+		t.Namespace = d.string()
+		t.Name = d.string()
+		return t, nil
 	case 'I':
 		i := Insert{}
 		i.RelationID = d.uint32()
