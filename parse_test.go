@@ -88,6 +88,16 @@ func TestParseWalData(t *testing.T) {
 					t.Errorf("val: %s", diff)
 				}
 			})
+		case Type:
+			if v.ID != 35756 {
+				t.Errorf("Type OID: %d", v.ID)
+			}
+			if v.Namespace != "public" {
+				t.Errorf("Type namespace: %s", v.Namespace)
+			}
+			if v.Name != "ticket_state" {
+				t.Errorf("Type name: %s", v.Name)
+			}
 		}
 	}
 }
