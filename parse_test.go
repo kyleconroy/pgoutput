@@ -36,7 +36,7 @@ func GenerateLogicalReplicationFiles(t *testing.T) {
 
 		message, err = conn.WaitForReplicationMessage(ctx)
 		if err != nil {
-			log.Fatalf("Replication failed: %v %s", err)
+			log.Fatalf("Replication failed: %v %s", message, err)
 		}
 
 		if message.WalMessage != nil {
