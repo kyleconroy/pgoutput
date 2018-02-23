@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"time"
 
 	"github.com/jackc/pgx"
 	"github.com/kyleconroy/pgoutput"
@@ -17,10 +16,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	// if err := conn.CreateReplicationSlot("sub2", "pgoutput"); err != nil {
-	// 	log.Fatalf("Failed to create replication slot: %v", err)
-	// }
 
 	set := pgoutput.NewRelationSet()
 
@@ -37,6 +32,7 @@ func main() {
 	}
 
 	handler := func(m pgoutput.Message) error {
+		return fmt.Errorf("hey")
 		switch v := m.(type) {
 		case pgoutput.Relation:
 			log.Printf("RELATION")
@@ -54,17 +50,8 @@ func main() {
 		return nil
 	}
 
-	replication := pgoutput.LogicalReplication{
-		Subscription:  "sub2",
-		Publication:   "pub2",
-		WaitTimeout:   time.Second * 10,
-		StatusTimeout: time.Second * 10,
-		Handler:       handler,
-	}
-
-	// Create slot
-
-	if err := replication.Start(ctx, conn); err != nil {
+	sub := pgoutput.NewSubscription("sub1", "pub1")
+	if err := sub.Start(ctx, conn, handler); err != nil {
 		log.Fatal(err)
 	}
 }
