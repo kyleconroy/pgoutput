@@ -34,9 +34,6 @@ func pluginArgs(version, publication string) string {
 }
 
 func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, h Handler) error {
-	// TODO: Struct Validation here
-	_ = conn.DropReplicationSlot(s.Name)
-
 	// If creating the replication slot fails with code 42710, this means
 	// the replication slot already exists.
 	err := conn.CreateReplicationSlot(s.Name, "pgoutput")
@@ -45,29 +42,11 @@ func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, h H
 		if !ok {
 			return fmt.Errorf("failed to create replication slot: %s", err)
 		}
+
 		if pgerr.Code != "42710" {
 			return fmt.Errorf("failed to create replication slot: %s", err)
 		}
 	}
-
-	// rows, err := conn.IdentifySystem()
-	// if err != nil {
-	// 		return err
-	// }
-
-	// var slotName, consitentPoint, snapshotName, outputPlugin string
-	// if err := row.Scan(&slotName, &consitentPoint, &snapshotName, &outputPlugin); err != nil {
-	// 	return err
-	// }
-
-	// log.Printf("slotName: %s\n", slotName)
-	// log.Printf("consitentPoint: %s\n", consitentPoint)
-	// log.Printf("snapshotName: %s\n", snapshotName)
-	// log.Printf("outputPlugin: %s\n", outputPlugin)
-
-	// Open a transaction on the server
-	// SET TRANSACTION SNAPSHOT id
-	// read all the data from the tables
 
 	err = conn.StartReplication(s.Name, 0, -1, pluginArgs("1", s.Publication))
 	if err != nil {
