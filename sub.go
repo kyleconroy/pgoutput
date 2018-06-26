@@ -30,24 +30,25 @@ func NewSubscription(name, publication string) *Subscription {
 }
 
 func pluginArgs(version, publication string) string {
-	return fmt.Sprintf(`("proto_version" '%s', "publication_names" '%s')`, version, publication)
+	return fmt.Sprintf(`"proto_version" '%s', "publication_names" '%s'`, version, publication)
 }
 
-func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, h Handler) error {
+func (s *Subscription) CreateSlot(conn *pgx.ReplicationConn) (err error) {
 	// If creating the replication slot fails with code 42710, this means
 	// the replication slot already exists.
-	err := conn.CreateReplicationSlot(s.Name, "pgoutput")
-	if err != nil {
+	if err = conn.CreateReplicationSlot(s.Name, "pgoutput"); err != nil {
 		pgerr, ok := err.(pgx.PgError)
-		if !ok {
-			return fmt.Errorf("failed to create replication slot: %s", err)
+		if !ok || pgerr.Code != "42710" {
+			return
 		}
 
-		if pgerr.Code != "42710" {
-			return fmt.Errorf("failed to create replication slot: %s", err)
-		}
+		err = nil
 	}
 
+	return
+}
+
+func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, h Handler) (err error) {
 	err = conn.StartReplication(s.Name, 0, -1, pluginArgs("1", s.Publication))
 	if err != nil {
 		return fmt.Errorf("failed to start replication: %s", err)
@@ -60,9 +61,11 @@ func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, h H
 		if err != nil {
 			return fmt.Errorf("error creating standby status: %s", err)
 		}
+
 		if err := conn.SendStandbyStatus(k); err != nil {
 			return fmt.Errorf("failed to send standy status: %s", err)
 		}
+
 		return nil
 	}
 
@@ -70,41 +73,53 @@ func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, h H
 	for {
 		select {
 		case <-tick:
-			log.Println("pub status")
 			if maxWal == 0 {
 				continue
 			}
-			if err := sendStatus(); err != nil {
-				return err
+
+			if err = sendStatus(); err != nil {
+				return
 			}
+
+		case <-ctx.Done():
+			return
+
 		default:
 			var message *pgx.ReplicationMessage
 			wctx, cancel := context.WithTimeout(ctx, s.WaitTimeout)
 			message, err = conn.WaitForReplicationMessage(wctx)
 			cancel()
+
 			if err == context.DeadlineExceeded {
 				continue
 			}
+
+			if err == context.Canceled {
+				return nil
+			}
+
 			if err != nil {
 				return fmt.Errorf("replication failed: %s", err)
 			}
+
 			if message.WalMessage != nil {
 				if message.WalMessage.WalStart > maxWal {
 					maxWal = message.WalMessage.WalStart
 				}
+
 				logmsg, err := Parse(message.WalMessage.WalData)
 				if err != nil {
 					return fmt.Errorf("invalid pgoutput message: %s", err)
 				}
-				if err := h(logmsg); err != nil {
-					return fmt.Errorf("error handling waldata: %s", err)
+
+				if err = h(logmsg); err != nil {
+					return fmt.Errorf("error handling WAL data: %s", err)
 				}
-			}
-			if message.ServerHeartbeat != nil {
+			} else if message.ServerHeartbeat != nil {
 				if message.ServerHeartbeat.ReplyRequested == 1 {
 					log.Println("server wants a reply")
-					if err := sendStatus(); err != nil {
-						return err
+					if err = sendStatus(); err != nil {
+						return
 					}
 				}
 			}
