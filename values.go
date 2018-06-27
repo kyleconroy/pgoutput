@@ -8,15 +8,19 @@ import (
 
 type RelationSet struct {
 	// TODO: Add mutex
-	relations map[uint32]Relation
+	relations map[uint32]*Relation
 }
 
 func NewRelationSet() *RelationSet {
-	return &RelationSet{relations: map[uint32]Relation{}}
+	return &RelationSet{relations: map[uint32]*Relation{}}
 }
 
-func (rs *RelationSet) Add(r Relation) {
+func (rs *RelationSet) Add(r *Relation) {
 	rs.relations[r.ID] = r
+}
+
+func (rs *RelationSet) Get(ID uint32) *Relation {
+	return rs.relations[ID]
 }
 
 func (rs *RelationSet) Values(id uint32, row []Tuple) (map[string]pgtype.Value, error) {
