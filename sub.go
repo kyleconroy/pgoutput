@@ -16,7 +16,7 @@ type Subscription struct {
 	CopyData      bool
 }
 
-type Handler func(Message) error
+type Handler func(Message, uint64) error
 
 func NewSubscription(name, publication string) *Subscription {
 	return &Subscription{
@@ -47,8 +47,8 @@ func (s *Subscription) CreateSlot(conn *pgx.ReplicationConn) (err error) {
 	return
 }
 
-func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, h Handler) (err error) {
-	err = conn.StartReplication(s.Name, 0, -1, pluginArgs("1", s.Publication))
+func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, startLSN uint64, h Handler) (err error) {
+	err = conn.StartReplication(s.Name, startLSN, -1, pluginArgs("1", s.Publication))
 	if err != nil {
 		return fmt.Errorf("failed to start replication: %s", err)
 	}
@@ -109,15 +109,16 @@ func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, h H
 					return fmt.Errorf("invalid pgoutput message: %s", err)
 				}
 
-				if err = h(logmsg); err != nil {
-					return fmt.Errorf("error handling WAL data: %s", err)
-				}
+				// Ignore the error from handler for now
+				h(logmsg, message.WalMessage.WalStart)
 			} else if message.ServerHeartbeat != nil {
 				if message.ServerHeartbeat.ReplyRequested == 1 {
 					if err = sendStatus(); err != nil {
 						return
 					}
 				}
+			} else {
+				return fmt.Errorf("No WalMessage/ServerHeartbeat defined, should not happen")
 			}
 		}
 	}
