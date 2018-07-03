@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/blind-oracle/pgoutput"
 	"github.com/jackc/pgx"
-	"github.com/kyleconroy/pgoutput"
 )
 
 func main() {
@@ -31,12 +31,11 @@ func main() {
 		return nil
 	}
 
-	handler := func(m pgoutput.Message) error {
-		return fmt.Errorf("hey")
+	handler := func(m pgoutput.Message, walPos uint64) error {
 		switch v := m.(type) {
 		case pgoutput.Relation:
 			log.Printf("RELATION")
-			set.Add(v)
+			set.Add(&v)
 		case pgoutput.Insert:
 			log.Printf("INSERT")
 			return dump(v.RelationID, v.Row)
@@ -51,7 +50,7 @@ func main() {
 	}
 
 	sub := pgoutput.NewSubscription("sub1", "pub1")
-	if err := sub.Start(ctx, conn, handler); err != nil {
+	if err := sub.Start(ctx, conn, 0, handler); err != nil {
 		log.Fatal(err)
 	}
 }

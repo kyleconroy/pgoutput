@@ -3,6 +3,8 @@ package pgoutput
 import (
 	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx"
@@ -22,8 +24,8 @@ func NewSubscription(name, publication string) *Subscription {
 	return &Subscription{
 		Name:          name,
 		Publication:   publication,
-		WaitTimeout:   time.Second * 10,
-		StatusTimeout: time.Second * 10,
+		WaitTimeout:   5 * time.Second,
+		StatusTimeout: 1 * time.Second,
 		CopyData:      true,
 	}
 }
@@ -53,55 +55,77 @@ func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, sta
 		return fmt.Errorf("failed to start replication: %s", err)
 	}
 
-	var maxWal uint64
+	maxWal := startLSN
 
-	sendStatus := func() error {
-		k, err := pgx.NewStandbyStatus(maxWal)
+	// Mutex is used to prevent reading and writing to a connection at the same time
+	var statusMtx sync.Mutex
+	sendStatus := func(wal uint64) error {
+		k, err := pgx.NewStandbyStatus(wal)
 		if err != nil {
-			return fmt.Errorf("error creating standby status: %s", err)
+			return fmt.Errorf("error creating status: %s", err)
 		}
 
+		statusMtx.Lock()
+		defer statusMtx.Unlock()
 		if err := conn.SendStandbyStatus(k); err != nil {
-			return fmt.Errorf("failed to send standy status: %s", err)
+			return err
 		}
 
 		return nil
 	}
 
-	tick := time.NewTicker(s.StatusTimeout)
-	defer tick.Stop()
+	go func() {
+		tick := time.NewTicker(s.StatusTimeout)
+		defer tick.Stop()
+
+		for {
+			select {
+			case <-tick.C:
+				if err = sendStatus(atomic.LoadUint64(&maxWal)); err != nil {
+					return
+				}
+
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	for {
 		select {
-		case <-tick.C:
-			if err = sendStatus(); err != nil {
-				return
+		case <-ctx.Done():
+			// Send final status
+			if err = sendStatus(atomic.LoadUint64(&maxWal)); err != nil {
+				return fmt.Errorf("Unable to send final status: %s", err)
 			}
 
-		case <-ctx.Done():
 			return
 
 		default:
 			var message *pgx.ReplicationMessage
 			wctx, cancel := context.WithTimeout(ctx, s.WaitTimeout)
+			statusMtx.Lock()
 			message, err = conn.WaitForReplicationMessage(wctx)
+			statusMtx.Unlock()
 			cancel()
 
 			if err == context.DeadlineExceeded {
 				continue
-			}
-
-			if err == context.Canceled {
+			} else if err == context.Canceled {
 				return nil
-			}
-
-			if err != nil {
+			} else if err != nil {
 				return fmt.Errorf("replication failed: %s", err)
 			}
 
 			if message.WalMessage != nil {
-				if message.WalMessage.WalStart > maxWal {
-					maxWal = message.WalMessage.WalStart
+				walStart := message.WalMessage.WalStart
+				// Skip stuff that's in past
+				if walStart > 0 && walStart <= startLSN {
+					continue
+				}
+
+				if walStart > atomic.LoadUint64(&maxWal) {
+					atomic.StoreUint64(&maxWal, walStart)
 				}
 
 				logmsg, err := Parse(message.WalMessage.WalData)
@@ -110,15 +134,15 @@ func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, sta
 				}
 
 				// Ignore the error from handler for now
-				h(logmsg, message.WalMessage.WalStart)
+				h(logmsg, walStart)
 			} else if message.ServerHeartbeat != nil {
 				if message.ServerHeartbeat.ReplyRequested == 1 {
-					if err = sendStatus(); err != nil {
+					if err = sendStatus(atomic.LoadUint64(&maxWal)); err != nil {
 						return
 					}
 				}
 			} else {
-				return fmt.Errorf("No WalMessage/ServerHeartbeat defined, should not happen")
+				return fmt.Errorf("No WalMessage/ServerHeartbeat defined in packet, should not happen")
 			}
 		}
 	}
