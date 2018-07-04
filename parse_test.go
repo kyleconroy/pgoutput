@@ -72,7 +72,7 @@ func TestParseWalData(t *testing.T) {
 
 		switch v := m.(type) {
 		case Relation:
-			set.Add(v)
+			set.Add(&v)
 		case Insert:
 			t.Run(fmt.Sprintf("waldata/%d", i), func(t *testing.T) {
 				values, err := set.Values(v.RelationID, v.Row)
