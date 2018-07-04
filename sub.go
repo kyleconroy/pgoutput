@@ -24,8 +24,8 @@ func NewSubscription(name, publication string) *Subscription {
 	return &Subscription{
 		Name:          name,
 		Publication:   publication,
-		WaitTimeout:   5 * time.Second,
-		StatusTimeout: 1 * time.Second,
+		WaitTimeout:   10 * time.Second,
+		StatusTimeout: 10 * time.Second,
 		CopyData:      true,
 	}
 }
