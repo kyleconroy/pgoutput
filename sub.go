@@ -16,17 +16,25 @@ type Subscription struct {
 	WaitTimeout   time.Duration
 	StatusTimeout time.Duration
 	CopyData      bool
+
+	conn   *pgx.ReplicationConn
+	maxWal uint64
+
+	// Mutex is used to prevent reading and writing to a connection at the same time
+	statusMtx sync.Mutex
 }
 
 type Handler func(Message, uint64) error
 
-func NewSubscription(name, publication string) *Subscription {
+func NewSubscription(conn *pgx.ReplicationConn, name, publication string) *Subscription {
 	return &Subscription{
 		Name:          name,
 		Publication:   publication,
-		WaitTimeout:   10 * time.Second,
+		WaitTimeout:   1 * time.Second,
 		StatusTimeout: 10 * time.Second,
 		CopyData:      true,
+
+		conn: conn,
 	}
 }
 
@@ -34,10 +42,11 @@ func pluginArgs(version, publication string) string {
 	return fmt.Sprintf(`"proto_version" '%s', "publication_names" '%s'`, version, publication)
 }
 
-func (s *Subscription) CreateSlot(conn *pgx.ReplicationConn) (err error) {
+// CreateSlot creates a replication slot if it doesn't exist
+func (s *Subscription) CreateSlot() (err error) {
 	// If creating the replication slot fails with code 42710, this means
 	// the replication slot already exists.
-	if err = conn.CreateReplicationSlot(s.Name, "pgoutput"); err != nil {
+	if err = s.conn.CreateReplicationSlot(s.Name, "pgoutput"); err != nil {
 		pgerr, ok := err.(pgx.PgError)
 		if !ok || pgerr.Code != "42710" {
 			return
@@ -49,30 +58,43 @@ func (s *Subscription) CreateSlot(conn *pgx.ReplicationConn) (err error) {
 	return
 }
 
-func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, startLSN uint64, h Handler) (err error) {
-	err = conn.StartReplication(s.Name, startLSN, -1, pluginArgs("1", s.Publication))
+func (s *Subscription) sendStatus(wal uint64, flush bool) error {
+	s.statusMtx.Lock()
+	defer s.statusMtx.Unlock()
+
+	var vals []uint64
+	if flush {
+		vals = []uint64{wal}
+	} else {
+		vals = []uint64{0, 0, wal}
+	}
+
+	k, err := pgx.NewStandbyStatus(vals...)
+	if err != nil {
+		return fmt.Errorf("error creating status: %s", err)
+	}
+
+	if err = s.conn.SendStandbyStatus(k); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Flush send the status message to server indicating that we've fully applied all of the events until maxWal.
+// This allows PostgreSQL to purge it's WAL logs
+func (s *Subscription) Flush() error {
+	return s.sendStatus(atomic.LoadUint64(&s.maxWal), true)
+}
+
+// Start starts replication and block until error or ctx is canceled
+func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (err error) {
+	err = s.conn.StartReplication(s.Name, startLSN, -1, pluginArgs("1", s.Publication))
 	if err != nil {
 		return fmt.Errorf("failed to start replication: %s", err)
 	}
 
-	maxWal := startLSN
-
-	// Mutex is used to prevent reading and writing to a connection at the same time
-	var statusMtx sync.Mutex
-	sendStatus := func(wal uint64) error {
-		k, err := pgx.NewStandbyStatus(wal)
-		if err != nil {
-			return fmt.Errorf("error creating status: %s", err)
-		}
-
-		statusMtx.Lock()
-		defer statusMtx.Unlock()
-		if err := conn.SendStandbyStatus(k); err != nil {
-			return err
-		}
-
-		return nil
-	}
+	s.maxWal = startLSN
 
 	go func() {
 		tick := time.NewTicker(s.StatusTimeout)
@@ -81,7 +103,7 @@ func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, sta
 		for {
 			select {
 			case <-tick.C:
-				if err = sendStatus(atomic.LoadUint64(&maxWal)); err != nil {
+				if err = s.sendStatus(atomic.LoadUint64(&s.maxWal), false); err != nil {
 					return
 				}
 
@@ -95,7 +117,7 @@ func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, sta
 		select {
 		case <-ctx.Done():
 			// Send final status
-			if err = sendStatus(atomic.LoadUint64(&maxWal)); err != nil {
+			if err = s.sendStatus(atomic.LoadUint64(&s.maxWal), false); err != nil {
 				return fmt.Errorf("Unable to send final status: %s", err)
 			}
 
@@ -104,9 +126,9 @@ func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, sta
 		default:
 			var message *pgx.ReplicationMessage
 			wctx, cancel := context.WithTimeout(ctx, s.WaitTimeout)
-			statusMtx.Lock()
-			message, err = conn.WaitForReplicationMessage(wctx)
-			statusMtx.Unlock()
+			s.statusMtx.Lock()
+			message, err = s.conn.WaitForReplicationMessage(wctx)
+			s.statusMtx.Unlock()
 			cancel()
 
 			if err == context.DeadlineExceeded {
@@ -124,8 +146,8 @@ func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, sta
 					continue
 				}
 
-				if walStart > atomic.LoadUint64(&maxWal) {
-					atomic.StoreUint64(&maxWal, walStart)
+				if walStart > atomic.LoadUint64(&s.maxWal) {
+					atomic.StoreUint64(&s.maxWal, walStart)
 				}
 
 				logmsg, err := Parse(message.WalMessage.WalData)
@@ -137,7 +159,7 @@ func (s *Subscription) Start(ctx context.Context, conn *pgx.ReplicationConn, sta
 				h(logmsg, walStart)
 			} else if message.ServerHeartbeat != nil {
 				if message.ServerHeartbeat.ReplyRequested == 1 {
-					if err = sendStatus(atomic.LoadUint64(&maxWal)); err != nil {
+					if err = s.sendStatus(atomic.LoadUint64(&s.maxWal), false); err != nil {
 						return
 					}
 				}
