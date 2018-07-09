@@ -3,6 +3,7 @@ package pgoutput
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,8 +18,9 @@ type Subscription struct {
 	StatusTimeout time.Duration
 	CopyData      bool
 
-	conn   *pgx.ReplicationConn
-	maxWal uint64
+	conn      *pgx.ReplicationConn
+	maxWal    uint64
+	walRetain uint64
 
 	// Mutex is used to prevent reading and writing to a connection at the same time
 	statusMtx sync.Mutex
@@ -26,7 +28,7 @@ type Subscription struct {
 
 type Handler func(Message, uint64) error
 
-func NewSubscription(conn *pgx.ReplicationConn, name, publication string) *Subscription {
+func NewSubscription(conn *pgx.ReplicationConn, name, publication string, walRetain uint64) *Subscription {
 	return &Subscription{
 		Name:          name,
 		Publication:   publication,
@@ -34,7 +36,8 @@ func NewSubscription(conn *pgx.ReplicationConn, name, publication string) *Subsc
 		StatusTimeout: 10 * time.Second,
 		CopyData:      true,
 
-		conn: conn,
+		conn:      conn,
+		walRetain: walRetain,
 	}
 }
 
@@ -58,18 +61,17 @@ func (s *Subscription) CreateSlot() (err error) {
 	return
 }
 
-func (s *Subscription) sendStatus(wal uint64, flush bool) error {
+func (s *Subscription) sendStatus(walWrite, walFlush uint64) error {
+	if walFlush > walWrite {
+		return fmt.Errorf("walWrite should be >= walFlush")
+	}
+
 	s.statusMtx.Lock()
 	defer s.statusMtx.Unlock()
 
-	var vals []uint64
-	if flush {
-		vals = []uint64{wal}
-	} else {
-		vals = []uint64{0, 0, wal}
-	}
+	log.Printf("sendStatus(): write %d fliush %d diff %d", walWrite, walFlush, walWrite-walFlush)
 
-	k, err := pgx.NewStandbyStatus(vals...)
+	k, err := pgx.NewStandbyStatus(walFlush, walFlush, walWrite)
 	if err != nil {
 		return fmt.Errorf("error creating status: %s", err)
 	}
@@ -81,10 +83,11 @@ func (s *Subscription) sendStatus(wal uint64, flush bool) error {
 	return nil
 }
 
-// Flush send the status message to server indicating that we've fully applied all of the events until maxWal.
+// Flush sends the status message to server indicating that we've fully applied all of the events until maxWal.
 // This allows PostgreSQL to purge it's WAL logs
 func (s *Subscription) Flush() error {
-	return s.sendStatus(atomic.LoadUint64(&s.maxWal), true)
+	wp := atomic.LoadUint64(&s.maxWal)
+	return s.sendStatus(wp, wp)
 }
 
 // Start starts replication and block until error or ctx is canceled
@@ -96,6 +99,19 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 
 	s.maxWal = startLSN
 
+	sendStatus := func() error {
+		var walFlush uint64
+		walPos := atomic.LoadUint64(&s.maxWal)
+
+		// Confirm only walRetain bytes in past
+		// If walRetain is zero - will confirm current walPos as flushed
+		if walPos > s.walRetain {
+			walFlush = walPos - s.walRetain
+		}
+
+		return s.sendStatus(walPos, walFlush)
+	}
+
 	go func() {
 		tick := time.NewTicker(s.StatusTimeout)
 		defer tick.Stop()
@@ -103,7 +119,7 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 		for {
 			select {
 			case <-tick.C:
-				if err = s.sendStatus(atomic.LoadUint64(&s.maxWal), false); err != nil {
+				if err = sendStatus(); err != nil {
 					return
 				}
 
@@ -117,7 +133,7 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 		select {
 		case <-ctx.Done():
 			// Send final status
-			if err = s.sendStatus(atomic.LoadUint64(&s.maxWal), false); err != nil {
+			if err = sendStatus(); err != nil {
 				return fmt.Errorf("Unable to send final status: %s", err)
 			}
 
@@ -159,7 +175,7 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 				h(logmsg, walStart)
 			} else if message.ServerHeartbeat != nil {
 				if message.ServerHeartbeat.ReplyRequested == 1 {
-					if err = s.sendStatus(atomic.LoadUint64(&s.maxWal), false); err != nil {
+					if err = sendStatus(); err != nil {
 						return
 					}
 				}
