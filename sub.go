@@ -163,6 +163,10 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 				return fmt.Errorf("replication failed: %s", err)
 			}
 
+			if message == nil {
+				return fmt.Errorf("replication failed: nil message received, should not happen")
+			}
+
 			if message.WalMessage != nil {
 				walStart := message.WalMessage.WalStart
 				// Skip stuff that's in past
