@@ -129,6 +129,10 @@ type Relation struct {
 	Columns   []Column
 }
 
+func (r Relation) IsEmpty() bool {
+	return r.ID == 0 && r.Name == "" && r.Replica == 0 && len(r.Columns) == 0
+}
+
 type Type struct {
 	// ID of the data type
 	ID        uint32
