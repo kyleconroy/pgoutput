@@ -20,7 +20,8 @@ func (rs *RelationSet) Add(r Relation) {
 }
 
 func (rs *RelationSet) Get(ID uint32) Relation {
-	return rs.relations[ID]
+	r, _ := rs.relations[ID]
+	return r
 }
 
 func (rs *RelationSet) Values(id uint32, row []Tuple) (map[string]pgtype.Value, error) {
