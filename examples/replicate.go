@@ -35,7 +35,7 @@ func main() {
 		switch v := m.(type) {
 		case pgoutput.Relation:
 			log.Printf("RELATION")
-			set.Add(&v)
+			set.Add(v)
 		case pgoutput.Insert:
 			log.Printf("INSERT")
 			return dump(v.RelationID, v.Row)
@@ -49,7 +49,7 @@ func main() {
 		return nil
 	}
 
-	sub := pgoutput.NewSubscription(conn, "sub1", "pub1")
+	sub := pgoutput.NewSubscription(conn, "sub1", "pub1", 1048576)
 	if err := sub.Start(ctx, 0, handler); err != nil {
 		log.Fatal(err)
 	}
