@@ -23,7 +23,7 @@ type Subscription struct {
 	walFlushed uint64
 
 	// Mutex is used to prevent reading and writing to a connection at the same time
-	statusMtx sync.Mutex
+	sync.Mutex
 }
 
 type Handler func(Message, uint64) error
@@ -66,8 +66,8 @@ func (s *Subscription) sendStatus(walWrite, walFlush uint64) error {
 		return fmt.Errorf("walWrite should be >= walFlush")
 	}
 
-	s.statusMtx.Lock()
-	defer s.statusMtx.Unlock()
+	s.Lock()
+	defer s.Unlock()
 
 	k, err := pgx.NewStandbyStatus(walFlush, walFlush, walWrite)
 	if err != nil {
@@ -89,10 +89,11 @@ func (s *Subscription) Flush() error {
 	if err == nil {
 		atomic.StoreUint64(&s.walFlushed, wp)
 	}
+
 	return err
 }
 
-// Start starts replication and block until error or ctx is canceled
+// Start replication and block until error or ctx is canceled
 func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (err error) {
 	err = s.conn.StartReplication(s.Name, startLSN, -1, pluginArgs("1", s.Publication))
 	if err != nil {
@@ -102,19 +103,19 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 	s.maxWal = startLSN
 
 	sendStatus := func() error {
-		var walFlush uint64
 		walPos := atomic.LoadUint64(&s.maxWal)
 		walLastFlushed := atomic.LoadUint64(&s.walFlushed)
 
 		// Confirm only walRetain bytes in past
 		// If walRetain is zero - will confirm current walPos as flushed
-		if walPos > s.walRetain {
-			walFlush = walPos - s.walRetain
-		}
+		walFlush := walPos - s.walRetain
 
-		// If there was a manual flush - report it's position until we're past it
 		if walLastFlushed > walFlush {
+			// If there was a manual flush - report it's position until we're past it
 			walFlush = walLastFlushed
+		} else if walFlush < 0 {
+			// If we have less than walRetain bytes - just report zero
+			walFlush = 0
 		}
 
 		return s.sendStatus(walPos, walFlush)
@@ -150,9 +151,9 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 		default:
 			var message *pgx.ReplicationMessage
 			wctx, cancel := context.WithTimeout(ctx, s.WaitTimeout)
-			s.statusMtx.Lock()
+			s.Lock()
 			message, err = s.conn.WaitForReplicationMessage(wctx)
-			s.statusMtx.Unlock()
+			s.Unlock()
 			cancel()
 
 			if err == context.DeadlineExceeded {
@@ -169,7 +170,8 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 
 			if message.WalMessage != nil {
 				walStart := message.WalMessage.WalStart
-				// Skip stuff that's in past
+
+				// Skip stuff that's in the past
 				if walStart > 0 && walStart <= startLSN {
 					continue
 				}
