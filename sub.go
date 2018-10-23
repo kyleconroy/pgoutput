@@ -15,12 +15,13 @@ type Subscription struct {
 	Publication   string
 	WaitTimeout   time.Duration
 	StatusTimeout time.Duration
-	CopyData      bool
 
 	conn       *pgx.ReplicationConn
 	maxWal     uint64
 	walRetain  uint64
 	walFlushed uint64
+
+	failOnHandler bool
 
 	// Mutex is used to prevent reading and writing to a connection at the same time
 	sync.Mutex
@@ -28,16 +29,16 @@ type Subscription struct {
 
 type Handler func(Message, uint64) error
 
-func NewSubscription(conn *pgx.ReplicationConn, name, publication string, walRetain uint64) *Subscription {
+func NewSubscription(conn *pgx.ReplicationConn, name, publication string, walRetain uint64, failOnHandler bool) *Subscription {
 	return &Subscription{
 		Name:          name,
 		Publication:   publication,
 		WaitTimeout:   1 * time.Second,
 		StatusTimeout: 10 * time.Second,
-		CopyData:      true,
 
-		conn:      conn,
-		walRetain: walRetain,
+		conn:          conn,
+		walRetain:     walRetain,
+		failOnHandler: failOnHandler,
 	}
 }
 
@@ -141,7 +142,7 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 	for {
 		select {
 		case <-ctx.Done():
-			// Send final status
+			// Send final status and exit
 			if err = sendStatus(); err != nil {
 				return fmt.Errorf("Unable to send final status: %s", err)
 			}
@@ -159,7 +160,7 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 			if err == context.DeadlineExceeded {
 				continue
 			} else if err == context.Canceled {
-				return nil
+				return
 			} else if err != nil {
 				return fmt.Errorf("replication failed: %s", err)
 			}
@@ -169,6 +170,7 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 			}
 
 			if message.WalMessage != nil {
+				var logmsg Message
 				walStart := message.WalMessage.WalStart
 
 				// Skip stuff that's in the past
@@ -180,13 +182,15 @@ func (s *Subscription) Start(ctx context.Context, startLSN uint64, h Handler) (e
 					atomic.StoreUint64(&s.maxWal, walStart)
 				}
 
-				logmsg, err := Parse(message.WalMessage.WalData)
+				logmsg, err = Parse(message.WalMessage.WalData)
 				if err != nil {
 					return fmt.Errorf("invalid pgoutput message: %s", err)
 				}
 
 				// Ignore the error from handler for now
-				h(logmsg, walStart)
+				if err = h(logmsg, walStart); err != nil && s.failOnHandler {
+					return
+				}
 			} else if message.ServerHeartbeat != nil {
 				if message.ServerHeartbeat.ReplyRequested == 1 {
 					if err = sendStatus(); err != nil {

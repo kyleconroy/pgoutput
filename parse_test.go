@@ -51,7 +51,7 @@ func GenerateLogicalReplicationFiles(t *testing.T) {
 
 func TestParseWalData(t *testing.T) {
 	files, _ := filepath.Glob("testdata/*")
-	set := NewRelationSet()
+	set := NewRelationSet(nil)
 
 	expected := map[int]struct {
 		ID  int32

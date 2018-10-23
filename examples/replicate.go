@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/blind-oracle/pgoutput"
 	"github.com/jackc/pgx"
+	"github.com/kyleconroy/pgoutput"
 )
 
 func main() {
@@ -17,7 +17,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	set := pgoutput.NewRelationSet()
+	set := pgoutput.NewRelationSet(nil)
 
 	dump := func(relation uint32, row []pgoutput.Tuple) error {
 		values, err := set.Values(relation, row)
@@ -49,7 +49,7 @@ func main() {
 		return nil
 	}
 
-	sub := pgoutput.NewSubscription(conn, "sub1", "pub1", 1048576)
+	sub := pgoutput.NewSubscription(conn, "sub1", "pub1", 0, false)
 	if err := sub.Start(ctx, 0, handler); err != nil {
 		log.Fatal(err)
 	}
