@@ -17,7 +17,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	set := pgoutput.NewRelationSet()
+	set := pgoutput.NewRelationSet(nil)
 
 	dump := func(relation uint32, row []pgoutput.Tuple) error {
 		values, err := set.Values(relation, row)
@@ -31,8 +31,7 @@ func main() {
 		return nil
 	}
 
-	handler := func(m pgoutput.Message) error {
-		return fmt.Errorf("hey")
+	handler := func(m pgoutput.Message, walPos uint64) error {
 		switch v := m.(type) {
 		case pgoutput.Relation:
 			log.Printf("RELATION")
@@ -50,8 +49,8 @@ func main() {
 		return nil
 	}
 
-	sub := pgoutput.NewSubscription("sub1", "pub1")
-	if err := sub.Start(ctx, conn, handler); err != nil {
+	sub := pgoutput.NewSubscription(conn, "sub1", "pub1", 0, false)
+	if err := sub.Start(ctx, 0, handler); err != nil {
 		log.Fatal(err)
 	}
 }
